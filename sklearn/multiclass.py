@@ -40,21 +40,20 @@ import scipy.sparse as sp
 import itertools
 
 from .base import BaseEstimator, ClassifierMixin, clone, is_classifier
+from .base import MultiOutputMixin
 from .base import MetaEstimatorMixin, is_regressor
 from .preprocessing import LabelBinarizer
 from .metrics.pairwise import euclidean_distances
 from .utils import check_random_state
 from .utils.validation import _num_samples
 from .utils.validation import check_is_fitted
-from .utils.validation import check_X_y
+from .utils.validation import check_X_y, check_array
 from .utils.multiclass import (_check_partial_fit_first_call,
                                check_classification_targets,
                                _ovr_decision_function)
 from .utils.metaestimators import _safe_split, if_delegate_has_method
 
-from .externals.joblib import Parallel
-from .externals.joblib import delayed
-from .externals.six.moves import zip as izip
+from joblib import Parallel, delayed
 
 __all__ = [
     "OneVsRestClassifier",
@@ -114,23 +113,24 @@ class _ConstantPredictor(BaseEstimator):
         return self
 
     def predict(self, X):
-        check_is_fitted(self, 'y_')
+        check_is_fitted(self)
 
         return np.repeat(self.y_, X.shape[0])
 
     def decision_function(self, X):
-        check_is_fitted(self, 'y_')
+        check_is_fitted(self)
 
         return np.repeat(self.y_, X.shape[0])
 
     def predict_proba(self, X):
-        check_is_fitted(self, 'y_')
+        check_is_fitted(self)
 
         return np.repeat([np.hstack([1 - self.y_, self.y_])],
                          X.shape[0], axis=0)
 
 
-class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
+class OneVsRestClassifier(MultiOutputMixin, ClassifierMixin,
+                          MetaEstimatorMixin, BaseEstimator):
     """One-vs-the-rest (OvR) multiclass/multilabel strategy
 
     Also known as one-vs-all, this strategy consists in fitting one classifier
@@ -154,14 +154,14 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
     Parameters
     ----------
     estimator : estimator object
-        An estimator object implementing `fit` and one of `decision_function`
-        or `predict_proba`.
+        An estimator object implementing :term:`fit` and one of
+        :term:`decision_function` or :term:`predict_proba`.
 
-    n_jobs : int, optional, default: 1
-        The number of jobs to use for the computation. If -1 all CPUs are used.
-        If 1 is given, no parallel computing code is used at all, which is
-        useful for debugging. For n_jobs below -1, (n_cpus + 1 + n_jobs) are
-        used. Thus for n_jobs = -2, all CPUs but one are used.
+    n_jobs : int or None, optional (default=None)
+        The number of jobs to use for the computation.
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
+        for more details.
 
     Attributes
     ----------
@@ -170,14 +170,19 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
 
     classes_ : array, shape = [`n_classes`]
         Class labels.
+
+    n_classes_ : int
+        Number of classes.
+
     label_binarizer_ : LabelBinarizer object
         Object used to transform multiclass labels to binary labels and
         vice-versa.
+
     multilabel_ : boolean
         Whether a OneVsRestClassifier is a multilabel classifier.
-    """
 
-    def __init__(self, estimator, n_jobs=1):
+    """
+    def __init__(self, estimator, n_jobs=None):
         self.estimator = estimator
         self.n_jobs = n_jobs
 
@@ -198,7 +203,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         self
         """
         # A sparse LabelBinarizer, with sparse_output=True, has been shown to
-        # outpreform or match a dense label binarizer in all cases and has also
+        # outperform or match a dense label binarizer in all cases and has also
         # resulted in less or equal memory consumption in the fit_ovr function
         # overall.
         self.label_binarizer_ = LabelBinarizer(sparse_output=True)
@@ -217,6 +222,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
 
         return self
 
+    @if_delegate_has_method('estimator')
     def partial_fit(self, X, y, classes=None):
         """Partially fit underlying estimators
 
@@ -257,7 +263,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
             self.label_binarizer_ = LabelBinarizer(sparse_output=True)
             self.label_binarizer_.fit(self.classes_)
 
-        if np.setdiff1d(y, self.classes_):
+        if len(np.setdiff1d(y, self.classes_)):
             raise ValueError(("Mini-batch contains {0} while classes " +
                              "must be subset of {1}").format(np.unique(y),
                                                              self.classes_))
@@ -267,9 +273,8 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         columns = (col.toarray().ravel() for col in Y.T)
 
         self.estimators_ = Parallel(n_jobs=self.n_jobs)(
-            delayed(_partial_fit_binary)(self.estimators_[i], X,
-                                         next(columns))
-            for i in range(self.n_classes_))
+            delayed(_partial_fit_binary)(estimator, X, column)
+            for estimator, column in zip(self.estimators_, columns))
 
         return self
 
@@ -286,12 +291,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         y : (sparse) array-like, shape = [n_samples, ], [n_samples, n_classes].
             Predicted multi-class targets.
         """
-        check_is_fitted(self, 'estimators_')
-        if (hasattr(self.estimators_[0], "decision_function") and
-                is_classifier(self.estimators_[0])):
-            thresh = 0
-        else:
-            thresh = .5
+        check_is_fitted(self)
 
         n_samples = _num_samples(X)
         if self.label_binarizer_.y_type_ == "multiclass":
@@ -302,8 +302,13 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
                 pred = _predict_binary(e, X)
                 np.maximum(maxima, pred, out=maxima)
                 argmaxima[maxima == pred] = i
-            return self.classes_[np.array(argmaxima.T)]
+            return self.classes_[argmaxima]
         else:
+            if (hasattr(self.estimators_[0], "decision_function") and
+                    is_classifier(self.estimators_[0])):
+                thresh = 0
+            else:
+                thresh = .5
             indices = array.array('i')
             indptr = array.array('i', [0])
             for e in self.estimators_:
@@ -338,7 +343,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
             Returns the probability of the sample for each class in the model,
             where classes are ordered as they are in `self.classes_`.
         """
-        check_is_fitted(self, 'estimators_')
+        check_is_fitted(self)
         # Y[i, j] gives the probability that sample i has the label j.
         # In the multi-label case, these are not disjoint.
         Y = np.array([e.predict_proba(X)[:, 1] for e in self.estimators_]).T
@@ -367,7 +372,9 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         -------
         T : array-like, shape = [n_samples, n_classes]
         """
-        check_is_fitted(self, 'estimators_')
+        check_is_fitted(self)
+        if len(self.estimators_) == 1:
+            return self.estimators_[0].decision_function(X)
         return np.array([est.decision_function(X).ravel()
                          for est in self.estimators_]).T
 
@@ -382,7 +389,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
 
     @property
     def coef_(self):
-        check_is_fitted(self, 'estimators_')
+        check_is_fitted(self)
         if not hasattr(self.estimators_[0], "coef_"):
             raise AttributeError(
                 "Base estimator doesn't have a coef_ attribute.")
@@ -393,7 +400,7 @@ class OneVsRestClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
 
     @property
     def intercept_(self):
-        check_is_fitted(self, 'estimators_')
+        check_is_fitted(self)
         if not hasattr(self.estimators_[0], "intercept_"):
             raise AttributeError(
                 "Base estimator doesn't have an intercept_ attribute.")
@@ -427,12 +434,14 @@ def _partial_fit_ovo_binary(estimator, X, y, i, j):
 
     cond = np.logical_or(y == i, y == j)
     y = y[cond]
-    y_binary = np.zeros_like(y)
-    y_binary[y == j] = 1
-    return _partial_fit_binary(estimator, X[cond], y_binary)
+    if len(y) != 0:
+        y_binary = np.zeros_like(y)
+        y_binary[y == j] = 1
+        return _partial_fit_binary(estimator, X[cond], y_binary)
+    return estimator
 
 
-class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
+class OneVsOneClassifier(MetaEstimatorMixin, ClassifierMixin, BaseEstimator):
     """One-vs-one multiclass strategy
 
     This strategy consists in fitting one classifier per class pair.
@@ -450,25 +459,32 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
     Parameters
     ----------
     estimator : estimator object
-        An estimator object implementing `fit` and one of `decision_function`
-        or `predict_proba`.
+        An estimator object implementing :term:`fit` and one of
+        :term:`decision_function` or :term:`predict_proba`.
 
-    n_jobs : int, optional, default: 1
-        The number of jobs to use for the computation. If -1 all CPUs are used.
-        If 1 is given, no parallel computing code is used at all, which is
-        useful for debugging. For n_jobs below -1, (n_cpus + 1 + n_jobs) are
-        used. Thus for n_jobs = -2, all CPUs but one are used.
+    n_jobs : int or None, optional (default=None)
+        The number of jobs to use for the computation.
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
+        for more details.
 
     Attributes
     ----------
-    estimators_ : list of `n_classes * (n_classes - 1) / 2` estimators
+    estimators_ : list of ``n_classes * (n_classes - 1) / 2`` estimators
         Estimators used for predictions.
 
     classes_ : numpy array of shape [n_classes]
         Array containing labels.
+
+    n_classes_ : int
+        Number of classes
+
+    pairwise_indices_ : list, length = ``len(estimators_)``, or ``None``
+        Indices of samples used when training the estimators.
+        ``None`` when ``estimator`` does not have ``_pairwise`` attribute.
     """
 
-    def __init__(self, estimator, n_jobs=1):
+    def __init__(self, estimator, n_jobs=None):
         self.estimator = estimator
         self.n_jobs = n_jobs
 
@@ -488,8 +504,12 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         self
         """
         X, y = check_X_y(X, y, accept_sparse=['csr', 'csc'])
+        check_classification_targets(y)
 
         self.classes_ = np.unique(y)
+        if len(self.classes_) == 1:
+            raise ValueError("OneVsOneClassifier can not be fit when only one"
+                             " class is present.")
         n_classes = self.classes_.shape[0]
         estimators_indices = list(zip(*(Parallel(n_jobs=self.n_jobs)(
             delayed(_fit_ovo_binary)
@@ -497,14 +517,12 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
             for i in range(n_classes) for j in range(i + 1, n_classes)))))
 
         self.estimators_ = estimators_indices[0]
-        try:
-            self.pairwise_indices_ = estimators_indices[1] \
-                                     if self._pairwise else None
-        except AttributeError:
-            self.pairwise_indices_ = None
+        self.pairwise_indices_ = (
+            estimators_indices[1] if self._pairwise else None)
 
         return self
 
+    @if_delegate_has_method(delegate='estimator')
     def partial_fit(self, X, y, classes=None):
         """Partially fit underlying estimators
 
@@ -533,9 +551,14 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         self
         """
         if _check_partial_fit_first_call(self, classes):
-            self.estimators_ = [clone(self.estimator) for i in
+            self.estimators_ = [clone(self.estimator) for _ in
                                 range(self.n_classes_ *
                                       (self.n_classes_ - 1) // 2)]
+
+        if len(np.setdiff1d(y, self.classes_)):
+            raise ValueError("Mini-batch contains {0} while it "
+                             "must be subset of {1}".format(np.unique(y),
+                                                            self.classes_))
 
         X, y = check_X_y(X, y, accept_sparse=['csr', 'csc'])
         check_classification_targets(y)
@@ -544,8 +567,8 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
             n_jobs=self.n_jobs)(
                 delayed(_partial_fit_ovo_binary)(
                     estimator, X, y, self.classes_[i], self.classes_[j])
-                for estimator, (i, j) in izip(
-                        self.estimators_, (combinations)))
+                for estimator, (i, j) in zip(self.estimators_,
+                                             (combinations)))
 
         self.pairwise_indices_ = None
 
@@ -569,6 +592,8 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
             Predicted multi-class targets.
         """
         Y = self.decision_function(X)
+        if self.n_classes_ == 2:
+            return self.classes_[(Y > 0).astype(np.int)]
         return self.classes_[Y.argmax(axis=1)]
 
     def decision_function(self, X):
@@ -587,7 +612,7 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         -------
         Y : array-like, shape = [n_samples, n_classes]
         """
-        check_is_fitted(self, 'estimators_')
+        check_is_fitted(self)
 
         indices = self.pairwise_indices_
         if indices is None:
@@ -601,7 +626,8 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
                                  for est, Xi in zip(self.estimators_, Xs)]).T
         Y = _ovr_decision_function(predictions,
                                    confidences, len(self.classes_))
-
+        if self.n_classes_ == 2:
+            return Y[:, 1]
         return Y
 
     @property
@@ -614,7 +640,7 @@ class OneVsOneClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         return getattr(self.estimator, "_pairwise", False)
 
 
-class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
+class OutputCodeClassifier(MetaEstimatorMixin, ClassifierMixin, BaseEstimator):
     """(Error-Correcting) Output-Code multiclass strategy
 
     Output-code based strategies consist in representing each class with a
@@ -631,8 +657,8 @@ class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
     Parameters
     ----------
     estimator : estimator object
-        An estimator object implementing `fit` and one of `decision_function`
-        or `predict_proba`.
+        An estimator object implementing :term:`fit` and one of
+        :term:`decision_function` or :term:`predict_proba`.
 
     code_size : float
         Percentage of the number of classes to be used to create the code book.
@@ -640,15 +666,17 @@ class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         one-vs-the-rest. A number greater than 1 will require more classifiers
         than one-vs-the-rest.
 
-    random_state : numpy.RandomState, optional
-        The generator used to initialize the codebook. Defaults to
-        numpy.random.
+    random_state : int, RandomState instance or None, optional, default: None
+        The generator used to initialize the codebook.  If int, random_state is
+        the seed used by the random number generator; If RandomState instance,
+        random_state is the random number generator; If None, the random number
+        generator is the RandomState instance used by `np.random`.
 
-    n_jobs : int, optional, default: 1
-        The number of jobs to use for the computation. If -1 all CPUs are used.
-        If 1 is given, no parallel computing code is used at all, which is
-        useful for debugging. For n_jobs below -1, (n_cpus + 1 + n_jobs) are
-        used. Thus for n_jobs = -2, all CPUs but one are used.
+    n_jobs : int or None, optional (default=None)
+        The number of jobs to use for the computation.
+        ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
+        ``-1`` means using all processors. See :term:`Glossary <n_jobs>`
+        for more details.
 
     Attributes
     ----------
@@ -680,7 +708,8 @@ class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
        2008.
     """
 
-    def __init__(self, estimator, code_size=1.5, random_state=None, n_jobs=1):
+    def __init__(self, estimator, code_size=1.5, random_state=None,
+                 n_jobs=None):
         self.estimator = estimator
         self.code_size = code_size
         self.random_state = random_state
@@ -701,12 +730,14 @@ class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         -------
         self
         """
+        X, y = check_X_y(X, y)
         if self.code_size <= 0:
-            raise ValueError("code_size should be greater than 0, got {1}"
+            raise ValueError("code_size should be greater than 0, got {0}"
                              "".format(self.code_size))
 
         _check_estimator(self.estimator)
         random_state = check_random_state(self.random_state)
+        check_classification_targets(y)
 
         self.classes_ = np.unique(y)
         n_classes = self.classes_.shape[0]
@@ -722,7 +753,7 @@ class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         else:
             self.code_book_[self.code_book_ != 1] = 0
 
-        classes_index = dict((c, i) for i, c in enumerate(self.classes_))
+        classes_index = {c: i for i, c in enumerate(self.classes_)}
 
         Y = np.array([self.code_book_[classes_index[y[i]]]
                       for i in range(X.shape[0])], dtype=np.int)
@@ -746,7 +777,8 @@ class OutputCodeClassifier(BaseEstimator, ClassifierMixin, MetaEstimatorMixin):
         y : numpy array of shape [n_samples]
             Predicted multi-class targets.
         """
-        check_is_fitted(self, 'estimators_')
+        check_is_fitted(self)
+        X = check_array(X)
         Y = np.array([_predict_binary(e, X) for e in self.estimators_]).T
         pred = euclidean_distances(Y, self.code_book_).argmin(axis=1)
         return self.classes_[pred]

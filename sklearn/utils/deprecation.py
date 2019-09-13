@@ -1,9 +1,11 @@
 import warnings
+import functools
+import sys
 
-__all__ = ["deprecated", ]
+__all__ = ["deprecated"]
 
 
-class deprecated(object):
+class deprecated:
     """Decorator to mark a function or class as deprecated.
 
     Issue a warning when the function is called/the class is instantiated and
@@ -14,29 +16,42 @@ class deprecated(object):
     in an empty of parentheses:
 
     >>> from sklearn.utils import deprecated
-    >>> deprecated() # doctest: +ELLIPSIS
+    >>> deprecated()
     <sklearn.utils.deprecation.deprecated object at ...>
 
     >>> @deprecated()
     ... def some_function(): pass
+
+    Parameters
+    ----------
+    extra : string
+          to be added to the deprecation messages
     """
 
-    # Adapted from http://wiki.python.org/moin/PythonDecoratorLibrary,
+    # Adapted from https://wiki.python.org/moin/PythonDecoratorLibrary,
     # but with many changes.
 
     def __init__(self, extra=''):
-        """
-        Parameters
-        ----------
-        extra : string
-          to be added to the deprecation messages
-
-        """
         self.extra = extra
 
     def __call__(self, obj):
+        """Call method
+
+        Parameters
+        ----------
+        obj : object
+        """
         if isinstance(obj, type):
             return self._decorate_class(obj)
+        elif isinstance(obj, property):
+            # Note that this is only triggered properly if the `property`
+            # decorator comes before the `deprecated` decorator, like so:
+            #
+            # @deprecated(msg)
+            # @property
+            # def deprecated_attribute_(self):
+            #     ...
+            return self._decorate_property(obj)
         else:
             return self._decorate_fun(obj)
 
@@ -66,13 +81,25 @@ class deprecated(object):
         if self.extra:
             msg += "; %s" % self.extra
 
+        @functools.wraps(fun)
         def wrapped(*args, **kwargs):
             warnings.warn(msg, category=DeprecationWarning)
             return fun(*args, **kwargs)
 
-        wrapped.__name__ = fun.__name__
-        wrapped.__dict__ = fun.__dict__
-        wrapped.__doc__ = self._update_doc(fun.__doc__)
+        wrapped.__doc__ = self._update_doc(wrapped.__doc__)
+        # Add a reference to the wrapped function so that we can introspect
+        # on function arguments in Python 2 (already works in Python 3)
+        wrapped.__wrapped__ = fun
+
+        return wrapped
+
+    def _decorate_property(self, prop):
+        msg = self.extra
+
+        @property
+        def wrapped(*args, **kwargs):
+            warnings.warn(msg, category=DeprecationWarning)
+            return prop.fget(*args, **kwargs)
 
         return wrapped
 
@@ -83,3 +110,38 @@ class deprecated(object):
         if olddoc:
             newdoc = "%s\n\n%s" % (newdoc, olddoc)
         return newdoc
+
+
+def _is_deprecated(func):
+    """Helper to check if func is wraped by our deprecated decorator"""
+    closures = getattr(func, '__closure__', [])
+    if closures is None:
+        closures = []
+    is_deprecated = ('deprecated' in ''.join([c.cell_contents
+                                              for c in closures
+                     if isinstance(c.cell_contents, str)]))
+    return is_deprecated
+
+
+def _raise_dep_warning_if_not_pytest(deprecated_path, correct_path):
+
+    # Raise a deprecation warning with standardized deprecation message.
+    # Useful because we are now deprecating # anything that isn't explicitly
+    # in an __init__ file.
+    # We don't want to raise a dep warning if we are in a pytest session else
+    # the CIs with -Werror::DeprecationWarning would fail. The deprecations are
+    # still properly tested in sklearn/tests/test_import_deprecations.py
+
+    # TODO: remove in 0.24 since this shouldn't be needed anymore.
+
+    message = (
+        "The {deprecated_path} module is  deprecated in version "
+        "0.22 and will be removed in version 0.24. "
+        "The corresponding classes / functions "
+        "should instead be imported from {correct_path}. "
+        "Anything that cannot be imported from {correct_path} is now "
+        "part of the private API."
+    ).format(deprecated_path=deprecated_path, correct_path=correct_path)
+
+    if not getattr(sys, '_is_pytest_session', False):
+        warnings.warn(message, DeprecationWarning)
